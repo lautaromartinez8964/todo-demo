@@ -1,0 +1,88 @@
+### 用例1： 正常访问user接口(成年人)
+GET http://localhost:8080/user?name=Jack&age=46
+
+###
+
+### 用例2： 正常访问user接口(未成年人)
+GET http://localhost:8080/user?name=Tom&age=15
+
+### 用例3: 异常测试(age 传入非数字 应该触发400)
+GET http://localhost:8080/user?name=Lucy&age=abc
+
+### 用例4: 异常测试(不传age 应该触发400)
+GET http://localhost:8080/user?name=Lucy
+
+### 用例5: 访问图书接口（路径参数）
+GET http://localhost:8080/book/1001
+
+### 用例6: 访问图书接口（传入非数字ID，应该报错）
+GET http://localhost:8080/book/three-kindoms
+
+### D2练习1: 访问带数字转换的搜索接口
+GET http://localhost:8080/search?q=Three-Kindoms&page=76
+
+### D2练习1: 访问带数字转换的搜索接口（传入非数字页码，应该报错）
+GET http://localhost:8080/search?q=Three-Kindoms&page=abc
+
+### D2练习2: 访问带范围限制的计算接口
+GET http://localhost:8080/square/8
+
+### D2练习2: 访问带范围限制的计算接口（传入超出范围的数字，应该报错）
+GET http://localhost:8080/square/999
+
+### D3用例1: 成功提交一个遥感任务
+POST http://localhost:8080/tasks
+Content-Type:application/json
+
+{
+    "task_name":"徐州土地覆盖分类",
+    "task_type":"classification",
+    "coordinate":{
+        "latitude":34.26,
+        "longitude":117.19
+    }
+}
+
+### D3用例2: 提交一个遥感任务,但经纬度超出范围，应该报错
+POST http://localhost:8080/tasks
+Content-Type:application/json
+
+{
+    "task_name":"徐州土地覆盖分类",
+    "task_type":"classification",
+    "coordinate":{
+        "latitude":100.00,
+        "longitude":200.00
+    }
+}
+
+### D3用例3：正常注册一个用户
+POST http://localhost:8080/register
+Content-Type:application/json
+
+{
+    "username":"testuser",
+    "email":"hdu37h37@qq.com",
+    "password":"testpass123"
+}
+
+### D3用例4：注册用户但邮箱格式错误+用户名太短，应该报错
+POST http://localhost:8080/register
+Content-Type:application/json
+
+{
+    "username":"t",
+    "email":"invalid-email-format",
+    "password":"testpass123"
+}
+
+### D3练习1: 注册用户但是密码小于6位，应该报错
+POST http://localhost:8080/register
+Content-Type:application/json
+
+{
+    "username":"hsdafbdhse",
+    "email":"h37dhb73@126.com",
+    "password":"324"
+}
+
