@@ -1,115 +1,217 @@
 package main
 
 import (
+	// 引入标准上下文，用于后续的超时控制
+	// 引入标准错误包，进行类型断言 [1]
 	"fmt"
 
-	"gorm.io/driver/mysql"
-	"gorm.io/gorm"
-	"gorm.io/gorm/logger" // 导入GORM官方日志包
+	"context" // 引入标准上下文，用于后续的超时控制
+	// 引入标准错误包，进行类型断言 [1]
+	"net/http"
+	"time"
+
+	"github.com/gin-gonic/gin"
+	"github.com/gin-gonic/gin/binding"
+	"github.com/go-playground/locales/zh"                                    // 1. 导入中文本地化 CLDR 语料库
+	ut "github.com/go-playground/universal-translator"                       // 2. 导入通用翻译管理器
+	"github.com/go-playground/validator/v10"                                 // 3. 导入核心验证器引擎
+	zh_translations "github.com/go-playground/validator/v10/translations/zh" // 4. 导入官方英文->中文翻译字典
 )
 
-type Task struct {
-	gorm.Model
-	TaskName  string  `gorm:"type:varchar(255);not null;index"`
-	TaskType  string  `gorm:"type:varchar(255);not null"`
-	Latitude  float64 `gorm:"not null"`
-	Longitude float64 `gorm:"not null"`
-	Status    bool    `gorm:"default:false"` // 已完成/未完成
+// =====
+// 1.全局变量设计（全局翻译器）
+// =====
+// trans承载着加载好的中文翻译字典，由于其底层设计，它是goroutine安全的，全局所有API共享
+var trans ut.Translator
+
+// =====
+// 2.遥感数据传输模型(DTO)与GIS空间约束Tag设计
+// =====
+type TaskCreateInput struct {
+	TaskName string `json:"task_name" binding:"required,min=3"`
+	TaskType string `json:"task_type" binding:"required"`
+
+	// chinaLat:我们自定义注册的"中国有效纬度限制器"
+	Latitude float64 `json:"latitude" binding:"required,chinalat"`
+	// chinaLat: 我们自定义注册的“中国有效经度限制器"
+	Longitude float64 `json:"longitude" binding:"required,chinalong"`
 }
 
-func main() {
-	dsn := "root:123456@tcp(127.0.0.1:3306)/todo_db?charset=utf8mb4&parseTime=True&loc=Local"
+// 今日挑战：Bounding Box范围合理性交叉校验器
+// 满足两个绝对不能颠倒的几何关系：MinLat < MaxLat, MinLong < MaxLong
+type ROIInput struct {
+	ROIName string  `json:"roi_name" binding:"required,min=3"`
+	MinLat  float64 `json:"min_lat" binding:"required,chinalat"`
+	MaxLat  float64 `json:"max_lat" binding:"required,chinalat"`
+	MinLong float64 `json:"min_long" binding:"required,chinalong"`
+	MaxLong float64 `json:"max_long" binding:"required,chinalong"`
+}
 
-	// 1.初始化数据库, 并开启详细的SQL日志输出
-	db, err := gorm.Open(mysql.Open(dsn), &gorm.Config{
-		// 核心:打开Info级别的日志，GORM会把底层翻译出的每一行SQL实时打印在控制台
-		Logger: logger.Default.LogMode(logger.Info),
-	})
-	if err != nil {
-		panic("数据库连接失败")
+// =====
+// 3.自定义字段级校验器函数
+// =====
+
+// validateChinaLat 校验传入的纬度是否落在我国物理领土范围内
+func validateChinaLat(fl validator.FieldLevel) bool {
+	lat := fl.Field().Float()
+	return lat >= 3.86 && lat <= 53.55 // 返回true代表校验通过
+}
+
+// validateChinaLng 校验传入的经度是否...
+func validateChinaLong(fl validator.FieldLevel) bool {
+	lng := fl.Field().Float()
+	return lng >= 73.66 && lng <= 135.05
+}
+
+// =====
+// 4.自定义结构体级校验器函数(Struct-level validator)
+// =====
+
+// validateNoFly 负责跨字段校验：如果经纬度落入我国敏感的禁飞区范围，直接熔断报错
+func validateNoFly(sl validator.StructLevel) {
+	// 1.通过sl.Current()拿到当前正在被校验的结构体反射值，并通过类型断言强行转换为TaskCreateInput
+	input := sl.Current().Interface().(TaskCreateInput)
+
+	// 2.业务规则定义：假设[39.00-41.00, 115.00-117.00]北京周边区域为禁飞区
+	if input.Latitude >= 39.00 && input.Latitude <= 41.00 && input.Longitude >= 115.00 && input.Longitude <= 117.00 {
+		// 跨字段人为报错：如果禁飞区，把错误人为挂载在”TaskName"这个字段上抛出
+		// 参数说明:错误实际值， 字段JSON名，字段结构体名， 自定义Tag名字，附加参数
+		sl.ReportError(input.TaskName, "task_name", "TaskName", "nofly", "")
 	}
+}
 
-	// 清空表重建，保证每次实验数据都干净
-	db.Migrator().DropTable(&Task{})
-	db.AutoMigrate(&Task{})
-
-	fmt.Println("\n--- GORM Hign-end CRUD Experiment---")
-
-	// ==== 场景1：批量插入（Create) ===
-	fmt.Println("\n[Scene 1]Batch Insert 5 RS Tasks ")
-	batchTasks := []Task{
-		{TaskName: "Beijing Daxing airport", TaskType: "Target Detection", Latitude: 39.5, Longitude: 116.4, Status: true},
-		{TaskName: "Valencia Flood", TaskType: "Change Detection", Latitude: 38.43, Longitude: -1.9, Status: true},
-		{TaskName: "Xuzhou Soil Moisture", TaskType: "Quantitative Inversion", Latitude: 36.98, Longitude: 117.5, Status: false},
-		{TaskName: "Xinjiang Gobi", TaskType: "Instance Segmentation", Latitude: 42.4, Longitude: 90.2, Status: false},
-		{TaskName: "Yangshan Harbour", TaskType: "Target Detection", Latitude: 30.86, Longitude: 121.87, Status: true},
-		{TaskName: "Yulin Mine Carbon Emissions", TaskType: "Quatitative Inversion", Latitude: 38.23, Longitude: 109.72, Status: false},
+// day7测试
+func validateROI(sl validator.StructLevel) {
+	input := sl.Current().Interface().(ROIInput)
+	if input.MinLat >= input.MaxLat {
+		sl.ReportError(input.MinLat, "min_lat", "MinLat", "latrange", "")
 	}
+	if input.MinLong >= input.MaxLong {
+		sl.ReportError(input.MinLong, "min_long", "MinLong", "lngrange", "")
+	}
+}
 
-	err = db.Transaction(func(tx *gorm.DB) error {
-		if err := tx.CreateInBatches(&batchTasks, 2).Error; err != nil {
-			return err
+// =====
+// 5.核心初始化函数:注册翻译器与自定义多层校验器
+// =====
+
+func initValidator() {
+	// A.拿到底层Gin框架启动时创建的原生validator.
+	if v, ok := binding.Validator.Engine().(*validator.Validate); ok {
+
+		// B.加载中文CLDR语料， 并实例化通用翻译管理器
+		zhLocale := zh.New()              // 实例化中文语料包
+		uni := ut.New(zhLocale, zhLocale) // 将其作为缺省和备用语言注册进 UT 翻译管理器
+
+		var found bool
+		trans, found = uni.GetTranslator("zh") // 提取出我们的中文翻译
+		if !found {
+			panic("CRITICAL: 初始化中文翻译器失败！")
 		}
-		return nil
-	})
-	if err != nil {
-		fmt.Printf("[ERROR]Batch write transactions failed:%v/n", err)
-	} else {
-		fmt.Printf("[ERROR]Successfullt Commit Transaction Batchly!")
-	}
 
-	// ==== 场景2: 高级条件分页查询(Read) ====
-	fmt.Println("\n[Scene 2]search for any Target Detection Tasks, in reverse created_at chronological order...")
+		// C.一键将官方提供的"英文->中文"翻译字典全部写进我们的翻译器中
+		if err := zh_translations.RegisterDefaultTranslations(v, trans); err != nil {
+			panic("CRITICAL: 初始化中文翻译器失败！")
+		}
 
-	var pageTasks []Task
-	pageSize := 2
-	page := 1
-	offset := (page - 1) * pageSize
-
-	// 链式调用:指定特定列 + 条件过滤 + 排序 + 分页限制[2]
-	db.Select("id", "task_name", "task_type", "status").
-		Where("task_type = ?", "Target Detection").
-		Where("status = ?", true).
-		Order("created_at DESC").
-		Limit(pageSize).
-		Offset(offset).
-		Find(&pageTasks)
-
-	fmt.Printf("查询到第%d页数据(共%d条):\n", page, len(pageTasks))
-	for _, t := range pageTasks {
-		fmt.Printf("-ID: %d | 名字: %s | 类型: %s | 状态: %t", t.ID, t.TaskName, t.TaskType, t.Status)
-	}
-
-	// ==== 场景三:0值更新深坑与拯救 ====
-	// GORM认为，如果一个字段是他的0值，（比如false, 0, ""),会直接忽略
-	// 因此Update的时候如果想把Status从true改回bool，不能直接更改 task.Status = false
-	if len(pageTasks) > 0 {
-		targetTask := pageTasks[0]
-
-		// ❌ 错误示范（如果你直接用 struct 更新，Status = false 会被 GORM 默默忽略）
-		// targetTask.Status = false                           		db.Model(&targetTask).Updates(targetTask)
-
-		// ✅ 工业级拯救法：使用 map 强制更新
-		db.Model(&targetTask).Updates(map[string]any{
-			"status": false,
+		// === 1.注册自定义字段级校验与翻译 ===
+		// D.注册chinalat校验器
+		v.RegisterValidation("chinalat", validateChinaLat)
+		// E.为chinalat注册翻译模板，如果错误，自动翻译
+		v.RegisterTranslation("chinalat", trans, func(ut ut.Translator) error {
+			// 占位符在运行时会被自动替换成经过翻译的字段名称(如纬度)
+			return ut.Add("chinalat", "{0}超出中国有效纬度物理范围！", true)
+		}, func(ut ut.Translator, fe validator.FieldError) string {
+			t, _ := ut.T("chinalat", fe.Field())
+			return t
 		})
 
-		fmt.Println(" [OK] Status is forced to false")
-	}
+		// F.注册chinalng校验器
+		v.RegisterValidation("chinalong", validateChinaLong)
+		// G.为chinalong注册翻译模板
+		v.RegisterTranslation("chinalong", trans, func(ut ut.Translator) error {
+			return ut.Add("chinalong", "{0}超出中国有效经度物理范围！", true)
+		}, func(ut ut.Translator, fe validator.FieldError) string {
+			t, _ := ut.T("chinalong", fe.Field())
+			return t
+		})
 
-	// ==== 场景4：物理删除(Unscoped Delete) ====
-	fmt.Println("\n[Scene 4]Physically Clear Data")
-	// 默认的db.Delete只是软删除
-	// 如果我们要彻底从物理硬盘上把这几条脏数据删除
-	// .Unscoped()是执行物理硬删除函数
-	// .Where("l = l") 提供恒真条件， 绕过GORM的裸删保护
-	err = db.Transaction(func(tx *gorm.DB) error {
-		// 事务直接返回Error
-		return tx.Unscoped().Where("1 = 1").Delete(&Task{}).Error
-	})
-	if err == nil {
-		fmt.Println("   [OK] 实验数据物理擦除完毕！")
-	} else {
-		fmt.Printf("删除失败:%v\n", err)
+		// === 2.注册自定义结构体级校验器 ===
+		// G.注册结构体级别关联校验：告诉验证器，凡是校验TaskCreateInput结构体的，必须额外跑一次我们写的validateNoFly跨字段函数
+		v.RegisterStructValidation(validateNoFly, TaskCreateInput{})
+
+		// H.为结构体级校验抛出的"nofly"Tag注册专属中文翻译
+		v.RegisterTranslation("nofly", trans, func(ut ut.Translator) error {
+			return ut.Add("nofly", "该任务的设定坐标落入了禁飞区，拒绝创建任务！", true)
+		}, func(ut ut.Translator, fe validator.FieldError) string {
+			t, _ := ut.T("nofly") // 模板里没占位符，就不要传参数
+			return t
+		})
+
+		// day7挑战：注册roi经纬度错误结构体级校验器
+		v.RegisterStructValidation(validateROI, ROIInput{})
+		v.RegisterTranslation("latrange", trans, func(ut ut.Translator) error {
+			return ut.Add("latrange", "ROI 区域最小纬度不能大于最大纬度，请检查经纬度区间输入！", true)
+		}, func(ut ut.Translator, fe validator.FieldError) string {
+			t, _ := ut.T("latrange")
+			return t
+		})
+		v.RegisterTranslation("lngrange", trans, func(ut ut.Translator) error {
+			return ut.Add("lngrange", "ROI 区域最小经度不能大于最大经度，请检查经纬度区间输入！", true)
+		}, func(ut ut.Translator, fe validator.FieldError) string {
+			t, _ := ut.T("lngrange")
+			return t
+		})
+
+		fmt.Println("[OK]自动翻译引擎&自定义多级GIS空间约束器初始化成功！")
 	}
+}
+
+// =====
+// 6.主控制与路由层(Controllers & Router)
+// =====
+
+func main() {
+	// 加载验证器
+	initValidator()
+
+	r := gin.Default()
+
+	r.POST("/tasks", func(c *gin.Context) {
+		// 注入Go并发控制的Context Timeout: 任何API与校验，最大出力时间不超过2s，超时自动熔断
+		ctx, cancel := context.WithTimeout(c.Request.Context(), 2*time.Second)
+		defer cancel()
+
+		var input TaskCreateInput
+
+		// 将带超时的上下文绑定进当前请求逻辑中
+		c.Request = c.Request.WithContext(ctx)
+
+		// 执行JSON绑定与反射参数验证
+		if err := c.ShouldBindJSON(&input); err != nil {
+			// 将通用err断言为validator专属的ValidationErrors错误切片
+			errs, ok := err.(validator.ValidationErrors)
+			if !ok { //如果是请求体格式问题，不是传入的数据不符合人为设定：
+				c.JSON(http.StatusBadRequest, gin.H{
+					"status": "error",
+					"error":  "非法的JSON数据请求体格式",
+				})
+				return
+			}
+			// 一行代码，全自动翻译！不再需要switch case
+			translateErrors := errs.Translate(trans)
+
+			c.JSON(http.StatusBadRequest, gin.H{
+				"status": "error",
+				"errors": translateErrors,
+			})
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{
+			"status":  "success",
+			"message": "恭喜！该遥感图像任务已经顺利通过国家边界范围校验与禁飞区阻断校验！",
+			"data":    input,
+		})
+	})
+	r.Run(":8080")
 }
