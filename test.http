@@ -1,51 +1,92 @@
+@baseUrl = http://localhost:8080
 
-
-### 用例 1：成功创建任务 (坐标处于上海，完全符合中国范围，且不属于禁飞区)
-POST http://localhost:8080/tasks
+### 1. 创建任务 - 成功案例
+POST {{baseUrl}}/tasks
 Content-Type: application/json
 
 {
-    "task_name": "上海黄浦江船只检测",
-    "task_type": "YOLO_V8",
+    "task_name": "上海电力巡检",
+    "task_type": "电力",
     "latitude": 31.23,
     "longitude": 121.47
 }
 
-###
-
-### 用例 2：异常测试——纬度直接飞到了北极 (超出中国边界，触发 chinalat 字段级拦截)
-POST http://localhost:8080/tasks
+### 2. 创建任务 - 失败：纬度超出中国范围
+POST {{baseUrl}}/tasks
 Content-Type: application/json
 
 {
-    "task_name": "北极圈模拟监测",
-    "task_type": "SAM",
-    "latitude": 85.0,
+    "task_name": "海外非法任务",
+    "task_type": "测绘",
+    "latitude": 1.0, 
     "longitude": 121.47
 }
 
-###
-
-### 用例 3：异常测试——坐标虽然符合中国范围，但精准落入北京禁飞限制区 [39.90, 116.40] (触发 nofly 结构体跨字段拦截)
-POST http://localhost:8080/tasks
+### 3. 创建任务 - 失败：命中禁飞区 (北京周边 39-41, 115-117)
+POST {{baseUrl}}/tasks
 Content-Type: application/json
 
 {
-    "task_name": "北京敏感空域任务",
-    "task_type": "YOLO_V8",
-    "latitude": 39.90,
+    "task_name": "故宫周边探测",
+    "task_type": "敏感任务",
+    "latitude": 40.0,
     "longitude": 116.40
 }
 
-###
-
-### 用例 4：异常测试——多重惨案 (名字过短 + 经度在太平洋 + 纬度在北极)
-POST http://localhost:8080/tasks
+### 4. 创建任务 - 失败：JSON 格式错误
+POST {{baseUrl}}/tasks
 Content-Type: application/json
 
 {
-    "task_name": "ab",
-    "task_type": "DeepLab",
-    "latitude": -20.0,
-    "longitude": 170.0
+    "task_name": "格式错误",
+    "latitude": "应该是非数字"
+}
+
+
+### 5. ROI 设置 - 成功案例
+POST {{baseUrl}}/rois
+Content-Type: application/json
+
+{
+    "roi_name": "华东监测区",
+    "min_lat": 30.0,
+    "max_lat": 32.0,
+    "min_long": 120.0,
+    "max_long": 122.0
+}
+
+### 6. ROI 设置 - 失败：纬度区间逻辑错误 (Min > Max)
+POST {{baseUrl}}/rois
+Content-Type: application/json
+
+{
+    "roi_name": "反向纬度区",
+    "min_lat": 40.0,
+    "max_lat": 30.0,
+    "min_long": 120.0,
+    "max_long": 122.0
+}
+
+### 7. ROI 设置 - 失败：经度区间逻辑错误 (Min > Max)
+POST {{baseUrl}}/rois
+Content-Type: application/json
+
+{
+    "roi_name": "反向经度区",
+    "min_lat": 30.0,
+    "max_lat": 32.0,
+    "min_long": 120.0,
+    "max_long": 110.0
+}
+
+### 8. ROI 设置 - 失败：名称太短
+POST {{baseUrl}}/rois
+Content-Type: application/json
+
+{
+    "roi_name": "A",
+    "min_lat": 30.0,
+    "max_lat": 32.0,
+    "min_long": 110.0,
+    "max_long": 120.0
 }
