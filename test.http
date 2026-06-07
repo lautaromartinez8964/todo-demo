@@ -1,92 +1,95 @@
-@baseUrl = http://localhost:8080
-
-### 1. 创建任务 - 成功案例
-POST {{baseUrl}}/tasks
+### 1. 创建任务 A (YOLO_V8)
+POST http://localhost:8080/tasks
 Content-Type: application/json
 
 {
-    "task_name": "上海电力巡检",
-    "task_type": "电力",
-    "latitude": 31.23,
-    "longitude": 121.47
+    "task_name": "北京大兴机场YOLO检测",
+    "task_type": "YOLO_V8",
+    "latitude": 39.5,
+    "longitude": 116.4
 }
 
-### 2. 创建任务 - 失败：纬度超出中国范围
-POST {{baseUrl}}/tasks
+### 2. 创建任务 B (DeepLab)
+POST http://localhost:8080/tasks
 Content-Type: application/json
 
 {
-    "task_name": "海外非法任务",
-    "task_type": "测绘",
-    "latitude": 1.0, 
-    "longitude": 121.47
+    "task_name": "上海港口DeepLab识别",
+    "task_type": "DeepLab",
+    "latitude": 31.2,
+    "longitude": 121.4
 }
 
-### 3. 创建任务 - 失败：命中禁飞区 (北京周边 39-41, 115-117)
-POST {{baseUrl}}/tasks
+### 3. 创建任务 C (YOLO_V8)
+POST http://localhost:8080/tasks
 Content-Type: application/json
 
 {
-    "task_name": "故宫周边探测",
-    "task_type": "敏感任务",
-    "latitude": 40.0,
-    "longitude": 116.40
+    "task_name": "广州车辆YOLO计数",
+    "task_type": "YOLO_V8",
+    "latitude": 23.1,
+    "longitude": 113.2
 }
 
-### 4. 创建任务 - 失败：JSON 格式错误
-POST {{baseUrl}}/tasks
-Content-Type: application/json
+### 4. 查询所有任务列表 - 第一次访问 (Cache Miss)
+### 逻辑：Redis 查无此列表 -> 去 MySQL 查询 -> 回写 Redis。
+### 观察终端：应显示 "[Cache Miss]缓存未命中，去MySQL硬盘里查询..."
+GET http://localhost:8080/tasks?page=1&page_size=10
 
-{
-    "task_name": "格式错误",
-    "latitude": "应该是非数字"
-}
+### 5. 查询所有任务列表 - 第二次访问 (Cache Hit)
+### 逻辑：直接从 Redis 内存读取。
+### 观察终端：应显示 "[Cache Hit]命中高速Redis内存!"
+GET http://localhost:8080/tasks?page=1&page_size=10
 
+### 6. 查询特定类型任务列表 (YOLO_V8) - 第一次访问 (Cache Miss)
+### 逻辑：生成新的 cacheKey -> Redis 查无 -> MySQL 查询 -> 回写 Redis。
+GET http://localhost:8080/tasks?task_type=YOLO_V8&page=1&page_size=10
 
-### 5. ROI 设置 - 成功案例
-POST {{baseUrl}}/rois
-Content-Type: application/json
+### 7. 查询特定类型任务列表 (YOLO_V8) - 第二次访问 (Cache Hit)
+### 逻辑：直接从 Redis 内存读取。
+GET http://localhost:8080/tasks?task_type=YOLO_V8&page=1&page_size=10
 
-{
-    "roi_name": "华东监测区",
-    "min_lat": 30.0,
-    "max_lat": 32.0,
-    "min_long": 120.0,
-    "max_long": 122.0
-}
+### 8. 查询特定类型任务列表 (DeepLab) - 第一次访问 (Cache Miss)
+### 逻辑：生成新的 cacheKey -> Redis 查无 -> MySQL 查询 -> 回写 Redis。
+GET http://localhost:8080/tasks?task_type=DeepLab&page=1&page_size=10
 
-### 6. ROI 设置 - 失败：纬度区间逻辑错误 (Min > Max)
-POST {{baseUrl}}/rois
-Content-Type: application/json
+### 9. 查询特定类型任务列表 (DeepLab) - 第二次访问 (Cache Hit)
+### 逻辑：直接从 Redis 内存读取。
+GET http://localhost:8080/tasks?task_type=DeepLab&page=1&page_size=10
 
-{
-    "roi_name": "反向纬度区",
-    "min_lat": 40.0,
-    "max_lat": 30.0,
-    "min_long": 120.0,
-    "max_long": 122.0
-}
+### 10. 查询所有任务列表 - 切换分页 (Cache Miss)
+### 逻辑：生成新的 cacheKey -> Redis 查无 -> MySQL 查询 -> 回写 Redis。
+GET http://localhost:8080/tasks?page=2&page_size=1
 
-### 7. ROI 设置 - 失败：经度区间逻辑错误 (Min > Max)
-POST {{baseUrl}}/rois
-Content-Type: application/json
+### 11. 查询所有任务列表 - 切换分页 (Cache Hit)
+### 逻辑：直接从 Redis 内存读取。
+GET http://localhost:8080/tasks?page=2&page_size=1
 
-{
-    "roi_name": "反向经度区",
-    "min_lat": 30.0,
-    "max_lat": 32.0,
-    "min_long": 120.0,
-    "max_long": 110.0
-}
+### 12. 查询不存在的任务类型 (Cache Miss -> Empty List -> Cache Rebuild)
+### 逻辑：Redis 查无 -> MySQL 返回空列表 -> 回写 Redis (空列表)。
+GET http://localhost:8080/tasks?task_type=NON_EXISTENT_TYPE&page=1&page_size=10
 
-### 8. ROI 设置 - 失败：名称太短
-POST {{baseUrl}}/rois
-Content-Type: application/json
+### 13. 查询不存在的任务类型 (Cache Hit)
+### 逻辑：直接从 Redis 内存读取 (空列表)。
+GET http://localhost:8080/tasks?task_type=NON_EXISTENT_TYPE&page=1&page_size=10
 
-{
-    "roi_name": "A",
-    "min_lat": 30.0,
-    "max_lat": 32.0,
-    "min_long": 110.0,
-    "max_long": 120.0
-}
+### 14. 查询单个任务详情 (假设 ID 为 1) - 第一次访问 (Cache Miss)
+### 逻辑：Redis 查无此项 -> 去 MySQL 爬数据 -> 随后回写 Redis 并设置 TTL。
+### 观察终端：应显示 "[Cache Miss]缓存未命中，去MySQL硬盘里查询..."
+GET http://localhost:8080/tasks/1
+
+### 15. 查询单个任务详情 (假设 ID 为 1) - 第二次访问 (Cache Hit)
+### 逻辑：直接从 Redis 内存读取 JSON 并反序列化，速度极快。
+### 观察终端：应显示 "[Cache Hit]命中高速Redis内存!"
+GET http://localhost:8080/tasks/1
+
+### 16. 查询不存在的单个任务 (404)
+### 逻辑：Redis 无数据 -> MySQL 报错 RecordNotFound -> 返回 404。
+GET http://localhost:8080/tasks/9999
+
+### 17. 非法 ID 格式测试
+### 逻辑：strconv.Atoi 转换失败，拦截非法请求。
+GET http://localhost:8080/tasks/abc
+
+### 18. 清空所有任务数据 (危险：物理全表擦除)
+DELETE http://localhost:8080/tasks/all
