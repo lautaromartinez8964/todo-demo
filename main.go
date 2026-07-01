@@ -1,40 +1,50 @@
 package main
 
 import (
-	"context" // 引入标准上下文，用来控制MySQL与Redis的请求生命周期
+	"context" // 用于数据库和Redis操作的超时控制
 	"encoding/json"
-
-	// 引入标准JSON序列化器，用来在Go结构体与Redis字符串之间做转换
 	"errors"
-	"fmt"
 	"net/http"
+
+	// 用于GORM结构体在写入Redis时的JSON序列化
+	"fmt"
 	"reflect"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/gin-gonic/gin/binding"
-	"github.com/go-playground/locales/zh"
-	ut "github.com/go-playground/universal-translator"
+	"github.com/go-playground/locales/zh"              //中文CLDR语料库
+	ut "github.com/go-playground/universal-translator" // 翻译器管理器
 	"github.com/go-playground/validator/v10"
 	zh_translations "github.com/go-playground/validator/v10/translations/zh"
-	"github.com/redis/go-redis/v9" // 导入go-redis/v9驱动包
+
+	"github.com/redis/go-redis/v9"
 	"gorm.io/driver/mysql"
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
 )
 
 // =====
-// 1.全局双引擎：MySQL关系型数据库与Redis内存型缓存
+// 1.全局系统架构：多连接池与高并发解耦Channel
 // =====
-var DB *gorm.DB         // 共享的MySQL连接池句柄
-var RDB *redis.Client   // 共享的Redis连接池句柄
-var trans ut.Translator // 翻译器
+
+var DB *gorm.DB         // 全局MySQL连接池指针
+var RDB *redis.Client   // 全局Redis缓存连接池指针
+var trans ut.Translator // 全局翻译器
+
+// 🌟 核心亮点：高并发异步任务派发通道（Day 9 生产者-消费者传送带）
+// 缓冲区设置为100，允许在极高并发下堆积100个推理任务，超过100后生产者会阻塞等待
+var TaskQueue = make(chan uint, 100) // 传输的是任务自增主键ID
+var WG sync.WaitGroup                // 主线程退出时，优雅等待所有后台检测goroutine退出
 
 // =====
-// 2.数据库实体定义(Entity)
+// 2.数据库模型定义(Entities) & 安全DTO定义
 // =====
+
+// 物理表实体
 type Task struct {
 	gorm.Model
 	TaskName  string  `gorm:"type:varchar(255);not null;index"`
@@ -44,61 +54,71 @@ type Task struct {
 	Status    bool    `gorm:"default:false"`
 }
 
-// =====
-// 3.安全传输对象层(DTO)与GIS空间标签约束
-// =====
+// 安全输入模型（杜绝批量赋值篡改漏洞)
 type TaskCreateInput struct {
 	TaskName  string  `json:"task_name" binding:"required,min=3"`
-	TaskType  string  `json:"task_type" binding:"required,min=3"`
+	TaskType  string  `json:"task_type" binding:"required"`
 	Latitude  float64 `json:"latitude" binding:"required,chinalat"`
 	Longitude float64 `json:"longitude" binding:"required,chinalng"`
 }
 
 // =====
-// 4.自定义GIS空间校验器函数
+// 3.自定义多层校验器（GIS空间约束）
 // =====
-func validateChinaLat(fl validator.FieldLevel) bool {
-	lat := fl.Field().Float()
+
+func validateChinaLat(f1 validator.FieldLevel) bool {
+	lat := f1.Field().Float()
 	return lat >= 3.86 && lat <= 53.55
 }
 
-func validateChinaLng(fl validator.FieldLevel) bool {
-	lng := fl.Field().Float()
+func validateChinaLng(f1 validator.FieldLevel) bool {
+	lng := f1.Field().Float()
 	return lng >= 73.66 && lng <= 135.05
 }
 
+// 跨字段结构体校验：禁飞区控制
+// 参数s1是validator传入的结构体级别校验上下文，通过它可以访问整个结构体实例
+func validateNoFly(s1 validator.StructLevel) {
+	input := s1.Current().Interface().(TaskCreateInput)
+	// 如果经纬度落在禁飞区，不给飞
+	if input.Latitude >= 39.00 && input.Latitude <= 41.00 && input.Longitude >= 115.00 && input.Longitude <= 117.00 {
+		s1.ReportError(input.TaskName, "task_name", "TaskName", "nofly", "")
+	}
+}
+
 // =====
-// 5.核心初始化函数：打通所有网络与数据库链路
+// 4.核心系统初始化模态
+// =====
+
 func initDatabases() {
-	// A.建立MySQL连接
-	dsn := "root:123456@tcp(127.0.0.1:3306)/todo_db?charset=utf8mb4&parseTime=True&loc=Local"
+	// A.连接MySQL
+	dsn := "root:your_password_123456@tcp(127.0.0.1:3306)/todo_db?charset=utf8mb4&parseTime=True&loc=Local"
 	var err error
 	DB, err = gorm.Open(mysql.Open(dsn), &gorm.Config{
 		Logger: logger.Default.LogMode(logger.Info),
 	})
 	if err != nil {
-		panic("CRITICAL:MySQL连接失败!" + err.Error())
+		panic("CRITICAL:MySQL连接失败! + err.Error()")
 	}
 	DB.AutoMigrate(&Task{})
-	fmt.Println("[OK]MySQL链路同步成功!")
+	fmt.Println("🚀 [MySQL] 自动建表与表结构同步顺利打通！")
 
-	// B.建立Redis内存级连接
+	// B.连接Redis(Day8)
 	RDB = redis.NewClient(&redis.Options{
-		Addr: "127.0.0.1:6379", // 连向我们在WSL里跑的原生Linux Redis
+		Addr: "127.0.0.1:6379",
 	})
-
-	// 强制发起Ping握手，确保Redis容器真实在线
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
+
 	if err := RDB.Ping(ctx).Err(); err != nil {
 		panic("CRITICAL:Redis连接失败!" + err.Error())
 	}
-	fmt.Println("[OK]Redis内存引擎链路成功!")
+	fmt.Println("🚀 [Redis] 内存引擎 Ping 握手通畅！")
 }
 
 func initValidator() {
 	if v, ok := binding.Validator.Engine().(*validator.Validate); ok {
-		// 1.让报错的变量名自动转换为json tag的名字
+		// 1.让报错的变量名能自动显示为前端看懂的json字段名
 		v.RegisterTagNameFunc(func(fld reflect.StructField) string {
 			name := strings.SplitN(fld.Tag.Get("json"), ",", 2)[0]
 			if name == "-" {
@@ -107,16 +127,16 @@ func initValidator() {
 			return name
 		})
 
-		// 2.装载中文语料与翻译字典
+		// 2.加载翻译字典
 		zhLocale := zh.New()
 		uni := ut.New(zhLocale, zhLocale)
 		trans, _ = uni.GetTranslator("zh")
 		zh_translations.RegisterDefaultTranslations(v, trans)
 
-		// 3.注册并绑定自定义空间Tag
+		// 3.注册自定义地理空间约束
 		v.RegisterValidation("chinalat", validateChinaLat)
 		v.RegisterTranslation("chinalat", trans, func(ut ut.Translator) error {
-			return ut.Add("chinalat", "{0}超出中国有效纬度范围！", true)
+			return ut.Add("chinalat", "{0}超出中国有效纬度范围!", true)
 		}, func(ut ut.Translator, fe validator.FieldError) string {
 			t, _ := ut.T("chinalat", fe.Field())
 			return t
@@ -124,55 +144,121 @@ func initValidator() {
 
 		v.RegisterValidation("chinalng", validateChinaLng)
 		v.RegisterTranslation("chinalng", trans, func(ut ut.Translator) error {
-			return ut.Add("chinalng", "{0}超出中国有效经度范围！", true)
+			return ut.Add("chinalng", "{0}超出中国有效经度范围!", true)
 		}, func(ut ut.Translator, fe validator.FieldError) string {
 			t, _ := ut.T("chinalng", fe.Field())
 			return t
 		})
-		fmt.Println("🚀 [OK] 自动翻译器与 GIS 自定义标签装载成功！")
-	}
 
+		// 4.注册结构体关联禁飞区校验
+		v.RegisterStructValidation(validateNoFly, TaskCreateInput{})
+
+		fmt.Println("🚀 [I18n] 自定义空间校验器与全自动翻译器部署就绪！")
+	}
 }
 
 // =====
-// 6.主程序与接口层
+// 5.高并发核心:后台异步推理消费者协程(Goroutine Worker)
 // =====
 
-func main() {
+// startBackgroundTaskWorker默默在后台盯着TaskQueue这个传送带
+// 一代发现有任务ID送过来，立刻叫醒，模拟调用YOLO推理检测，并回写MySQL
+func startBackgroundTaskWorker(ctx context.Context) {
+	defer WG.Done() // goroutine退出的时候，通知WaitGroup计数器-1
+	fmt.Println("[Worker]后端异步遥感推理goroutine已就位,开始紧盯流水线...")
+
+	for {
+		select {
+		case <-ctx.Done():
+			// 如果主线程（main) 发出了关闭指令(cancel), 优雅退出
+			fmt.Println("👷 [Worker] 收到主线程安全退出信号，正在优雅关闭协程并妥善保存现场...")
+			return
+		case taskID, ok := <-TaskQueue:
+			if !ok {
+				// 如果管道被关闭了，说明不会有任务了，安全下班
+				return
+			}
+			// 真正处理这个任务
+			processTask(taskID)
+		}
+	}
+}
+
+// 模拟调用Python推理并回写
+func processTask(taskID uint) {
+	fmt.Printf("\n[Worker]发现新任务ID:%d, 开始调用YOLO算法服务识别...\n", taskID)
+
+	// 模拟复杂的算法识别过程
+	time.Sleep(2 * time.Second)
+
+	var taskProcess Task
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	err := DB.WithContext(ctx).First(&taskProcess, taskID).Error
+	if err != nil {
+		fmt.Println("[Worker]在数据库里没有找到这个任务呢")
+		return
+	}
+	result := DB.WithContext(ctx).Model(&taskProcess).Select("status").Updates(map[string]any{
+		"status": true,
+	})
+	if result.Error != nil {
+		fmt.Println("[Worker]更新任务状态失败！")
+		return
+	}
+
+	// redis缓存一致性：因为任务状态发生了修改，必须立刻删除该任务的缓存
+	cacheKey := fmt.Sprintf("tasks:detail:%d", taskProcess.ID)
+	err = RDB.Del(ctx, cacheKey).Err()
+	if err != nil {
+		fmt.Println("[Worker]更新缓存失败！")
+	}
+}
+
+// =====
+// 6.主程序与网络控制器层(Gin Web API Handlers)
+// =====
+
+func ma() {
+	// A.初始化双引擎和验证器
 	initDatabases()
 	initValidator()
+
+	// B.启动后台异步处理goroutine(生产者-消费者模型)
+	ctx, cancelGlobal := context.WithCancel(context.Background())
+	WG.Add(1)                         // 告诉WaitGroup我们要启动一个后台任务了
+	go startBackgroundTaskWorker(ctx) // 启动消费者
 
 	r := gin.Default()
 
 	// -----
-	// [接口1]：创建任务（安全DTO过滤 + 参数自动翻译 + 缓存失效控制)
+	// 🚀 [接口 1]：高并发异步提交任务接口 (POST /tasks)
 	// -----
 	r.POST("/tasks", func(c *gin.Context) {
-		// 建议将超时时间适当延长到 5 秒，防止 WSL 磁盘响应慢
-		ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
-		defer cancel() // cancel是一个函数，调用它会立即停止计时器，并释放占用的资源
-		c.Request = c.Request.WithContext(ctx)
+		timeoutCtx, cancel := context.WithTimeout(c.Request.Context(), 2*time.Second)
+		defer cancel()
+		c.Request = c.Request.WithContext(timeoutCtx)
 
 		var input TaskCreateInput
-		// A.校验
+		// A.校验器开始校验，JSON转结构体
 		if err := c.ShouldBindBodyWithJSON(&input); err != nil {
 			errs, ok := err.(validator.ValidationErrors)
 			if !ok {
 				c.JSON(http.StatusBadRequest, gin.H{
 					"status": "error",
-					"error":  "验证器解析失败或JSON格式错误",
-				})
-				return
-			} else {
-				c.JSON(http.StatusBadRequest, gin.H{
-					"status": "error",
-					"error":  errs.Translate(trans),
+					"error":  "非法JSON",
 				})
 				return
 			}
+			c.JSON(http.StatusBadRequest, gin.H{
+				"status": "error",
+				"error":  errs.Translate(trans),
+			})
+			return
 		}
 
-		// B.安全过滤：将安全的DTO字段拷贝给实体， 防止批量赋值注入
+		// B.过滤：将安全的DTO字段拷贝给实体
 		newTask := Task{
 			TaskName:  input.TaskName,
 			TaskType:  input.TaskType,
@@ -181,34 +267,34 @@ func main() {
 			Status:    false,
 		}
 
-		// C.写入MySQL
-		if err := DB.WithContext(ctx).Create(&newTask).Error; err != nil {
-			c.JSON(500, gin.H{
+		if err := DB.WithContext(timeoutCtx).Create(&newTask).Error; err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{
 				"status": "error",
-				"error":  "MySQL写入失败:" + err.Error(),
+				"error":  "MySQL创建任务失败:" + err.Error(),
 			})
 			return
 		}
 
-		// D.旁路缓存一致性：数据更新，直接“强制删除”可能存在的旧缓存，防止读到脏数据
-		// 根据刚刚写入MySQL后自动生成的自增ID（newTask.ID),拼装出一个在Redis中唯一的标识符
-		cacheKey := fmt.Sprintf(
-			"tasks:detail:%d", newTask.ID,
-		)
+		// C.一致性保障：强制擦除可能存在ID详情的Redis焕春
+		cacheKey := fmt.Sprintf("tasks:detail:%d", newTask.ID)
+		RDB.Del(timeoutCtx, cacheKey)
 
-		// 金科玉律：只要发生了“写（增，删，改）”操作，都要对该数据的缓存执行“删除”动作
-		RDB.Del(ctx, cacheKey) // 即使缓存不存在，Del操作也是安全的
-		c.JSON(http.StatusCreated, gin.H{
+		// 生产者核心：将新任务的ID，塞入异步处理通道
+		// 后台的Worker协程会被立刻唤醒并进行处理
+		TaskQueue <- newTask.ID
+
+		// 快速返回200给用户，不卡死，不等待，用户体验完美
+		c.JSON(http.StatusOK, gin.H{
 			"status":  "success",
-			"message": "成功创建任务",
+			"message": "遥感检测任务创建成功，已提交后台异步推理，请稍后查看结果!",
 			"data":    newTask,
 		})
 
 	})
 
-	// ----
-	// 核心接口 2：高并发冷热分离——单条任务详情查询（GET /tasks/:id)
-	// ----
+	// -----
+	// [接口2]：高并发冷热分离任务详情查询(GET/tasks/:id)
+	// -----
 	r.GET("/tasks/:id", func(c *gin.Context) {
 		idStr := c.Param("id")
 		id, err := strconv.Atoi(idStr)
@@ -220,150 +306,22 @@ func main() {
 			return
 		}
 
-		// 声明高并发专用的超时Context
-		ctx, cancel := context.WithTimeout(c.Request.Context(), 2*time.Second)
+		// claim高并发专用的超时context
+		timeoutCtx, cancel := context.WithTimeout(c.Request.Context(), 2*time.Second)
 		defer cancel()
+		c.Request = c.Request.WithContext(timeoutCtx)
 
-		// 规划标准Redis键命名，格式是： "tasks:detail:{ID}"
-		// 是一个唯一的字符串标识符，用于在 Redis 中定位和检索数据
-		cacheKey := fmt.Sprintf(
-			"tasks:detail:%d", id,
-		)
-
-		// ==== 步骤A : [热查询]去高速内存Redis里面找 ====
-		cacheVal, err := RDB.Get(ctx, cacheKey).Result()
-
-		// 状态1：缓存命中(Cache Hit)!
-		if err == nil {
-			fmt.Println("[Cache Hit]命中高速Redis内存!零磁盘I/O极速响应!")
-			var cachedTask Task
-
-			// 将Redis里的纯文本JSON字符串，反序列化还原为Go的结构体内存对象
-			json.Unmarshal([]byte(cacheVal), &cachedTask)
-
-			c.JSON(http.StatusOK, gin.H{
-				"status": "success",
-				"source": "redic_cache", // 标记数据来源于缓存
-				"data":   cachedTask,
-			})
-			return
-		}
-
-		// 如果发生了除了"未找到(redis.Nil)”之外的其他网络报错，进行日志预警
-		if !errors.Is(err, redis.Nil) {
-			fmt.Printf("[Warning]Redis读取发生异常:%s\n", err.Error())
-		}
-
-		// ==== 步骤B:[冷查询]缓存未命中（Cache Miss),去硬盘MySQL里面爬====
-		fmt.Println("[Cache Miss]缓存未命中，去MySQL硬盘里查询...")
-		var dbTask Task
-		dbErr := DB.WithContext(ctx).First(&dbTask, id).Error
-
-		if dbErr != nil {
-			if errors.Is(dbErr, gorm.ErrRecordNotFound) {
-				c.JSON(http.StatusNotFound, gin.H{
-					"status": "error",
-					"error":  "该任务确实不存在",
-				})
-				return
-			}
-			c.JSON(500, gin.H{
-				"status": "error",
-				"error":  "MySQL数据库查询故障",
-			})
-		}
-
-		// ==== 步骤C：[回写缓存]将最新数据回写到Redis，方便下一个访问的人
-		// 将Go的结构体对象，序列化为JSON字符串，以方便写进Redis
-		jsonBytes, _ := json.Marshal(dbTask)
-
-		// 极其重要：必须设置生存过期时间（TTL)!这里设置为5分钟
-		// 作用： 防止过期的冷垃圾数据长期霸占内存导致Redis发生内存溢出（OOM)崩溃！
-
-		// 向Redis写入数据的核心命令 cacheKey是redis的键， string(json.Marshal(dbTask))是redis键值对的值
-		RDB.Set(ctx, cacheKey, string(jsonBytes), 5*time.Minute)
-		fmt.Println("💾 [Cache Rebuild] 已成功将最新数据回写至 Redis 内存，并注入 5分钟 倒计时过期。")
-
-		c.JSON(http.StatusOK, gin.H{
-			"status": "success",
-			"source": "mysql_db", //标记数据来源于物理硬盘
-			"data":   dbTask,
-		})
-
-	})
-
-	// [接口3]：删除任务(先擦除硬盘，检查删除行数，最后再删缓存)
-	r.DELETE("/tasks/:id/clean", func(c *gin.Context) {
-		idStr := c.Param("id")
-		id, err := strconv.Atoi(idStr)
-		if err != nil || id <= 0 {
-			c.JSON(http.StatusBadRequest, gin.H{
-				"status": "error",
-				"error":  "ID Format Error",
-			})
-			return
-		}
-		ctx, cancel := context.WithTimeout(c.Request.Context(), 2*time.Second)
-		defer cancel()
-		c.Request = c.Request.WithContext(ctx)
-
-		// 先从硬盘里面物理擦除(以DB为主，确保成功后再清缓存)
-		result := DB.Unscoped().Delete(&Task{}, id)
-		if result.Error != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{
-				"status": "error",
-				"error":  "物理清除失败:" + result.Error.Error(),
-			})
-			return
-		}
-
-		// RowAffected记录了这次删除SQL到底在硬盘里擦除了几行数据
-		if result.RowsAffected == 0 {
-			c.JSON(http.StatusNotFound, gin.H{
-				"status": "error",
-				"error":  "未找到对应记录",
-			})
-			return
-		}
-
-		// DB删除成功后再清理缓存
+		// redis键
 		cacheKey := fmt.Sprintf("tasks:detail:%d", id)
-		RDB.Del(ctx, cacheKey)
 
-		c.JSON(http.StatusOK, gin.H{
-			"status":  "success",
-			"message": "成功物理删除任务",
-		})
-	})
+		// A.热查询：先查redis
+		cacheVal, err := RDB.Get(timeoutCtx, cacheKey).Result()
 
-	// day8 今日挑战：获取分页任务列表
-	r.GET("/tasks", func(c *gin.Context) {
-		// 获取字符串类型的参数
-		pageStr := c.DefaultQuery("page", "1")
-		pageSizeStr := c.DefaultQuery("page_size", "10")
-		taskType := c.Query("task_type")
-
-		page, _ := strconv.Atoi(pageStr)
-		pageSize, _ := strconv.Atoi(pageSizeStr)
-		offset := (page - 1) * pageSize
-
-		ctx, cancel := context.WithTimeout(c.Request.Context(), 2*time.Second)
-		defer cancel()
-		c.Request = c.Request.WithContext(ctx)
-
-		// 分页任务下的redis命名
-		cacheKey := fmt.Sprintf("tasks:list:type:%s:page:%d:size:%d", taskType, page, pageSize)
-
-		// 热查询：去Redis查询
-		cacheVal, err := RDB.Get(ctx, cacheKey).Result()
-
-		//  状态1：缓存命中
+		// 缓存命中(Cache Hit)
 		if err == nil {
-			fmt.Println("[Cache Hit]命中高速Redis内存!")
-			var cachedTask []Task // 必须使用切片[]Task,与写入端的类型保持严格对称！（会查到多条任务）
-
-			// 反序列化 JSON->Task结构体
-			json.Unmarshal([]byte(cacheVal), &cachedTask)
+			fmt.Println("[Cache Hit!]命中Redis缓存！")
+			var cachedTask Task
+			json.Unmarshal([]byte(cacheVal), &cachedTask) // 反序列化
 			c.JSON(http.StatusOK, gin.H{
 				"status": "success",
 				"source": "redis_cache",
@@ -372,47 +330,34 @@ func main() {
 			return
 		}
 
-		// 如果发生了除了未找到以外的其他网络报错，日志预警
+		// 如果发生出了未找到(redis.Nil)外的报错，警告
 		if !errors.Is(err, redis.Nil) {
 			fmt.Printf("[Warning]Redis读取发生异常:%s\n", err.Error())
 		}
 
-		// 状态2：缓存未命中
-		// 冷查询：去MySQL物理硬盘里查询
-		// 使用GORM动态查询链构建SQL,防止taskType为空时陷入“查询黑洞”
-		fmt.Println("[Cache Miss]缓存未命中，去MySQL硬盘里查询...")
-
-		query := DB.WithContext(ctx).Model(&Task{})
-		if taskType != "" {
-			query = query.Where("task_type = ?", taskType)
-		}
-		var dbTask []Task
-		dbErr := query.Select("id", "task_name", "task_type", "status", "created_at").
-			Order("created_at DESC").
-			Limit(pageSize).
-			Offset(offset).
-			Find(&dbTask).
-			Error
-
+		// B.冷查询：缓存未命中，查MySQL
+		fmt.Println("[Cache Miss]缓存未命中，查询MySQL...")
+		var dbTask Task
+		dbErr := DB.WithContext(timeoutCtx).First(&dbTask, id).Error
 		if dbErr != nil {
 			if errors.Is(dbErr, gorm.ErrRecordNotFound) {
 				c.JSON(http.StatusNotFound, gin.H{
-					"status": "ereror",
-					"error":  "未找到对应记录",
+					"status": "error",
+					"error":  "任务不存在",
 				})
 				return
 			}
 			c.JSON(http.StatusInternalServerError, gin.H{
 				"status": "error",
-				"error":  "访问数据库失败",
+				"error":  "查询MySQL错误",
 			})
 			return
+
 		}
 
-		// 回写缓存
+		// C.回写缓存：序列化后写入Redis， 设置5分钟过期时间
 		jsonBytes, _ := json.Marshal(dbTask)
-		RDB.Set(ctx, cacheKey, string(jsonBytes), 2*time.Minute)
-		fmt.Println("💾 [Cache Rebuild] 已成功将最新数据回写至 Redis 内存，并注入 2分钟 倒计时过期")
+		RDB.Set(timeoutCtx, cacheKey, string(jsonBytes), 5*time.Second)
 
 		c.JSON(http.StatusOK, gin.H{
 			"status": "success",
@@ -421,33 +366,23 @@ func main() {
 		})
 	})
 
-	// [接口4]：清空所有任务数据 (物理彻底擦除全表 + 同步清理 Redis 缓存， 主键ID变为1)
-	r.DELETE("/tasks/all", func(c *gin.Context) {
-		ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
-		defer cancel()
+	// 启动web服务在一个单独的goroutine中，以便main函数可以监听信号进行优雅关闭
+	srv := &http.Server{
+		Addr:    ":8080",
+		Handler: r,
+	}
 
-		// A. 使用 TRUNCATE 彻底清空表并重置自增 ID 计数器为 1
-		// 注意：TRUNCATE 是 DDL 操作，会重置 AUTO_INCREMENT
-		if err := DB.WithContext(ctx).Exec("TRUNCATE TABLE tasks").Error; err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{
-				"status": "error",
-				"error":  "清空数据库失败: " + err.Error(),
-			})
-			return
+	go func() {
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			panic(fmt.Sprintf("Gin server failed to start: %v", err))
 		}
+	}()
 
-		// B. 同步清理 Redis 缓存
-		// 使用 Scan 模式查找所有以 tasks: 开头的键并删除，防止数据库空了但缓存还有旧数据
-		iter := RDB.Scan(ctx, 0, "tasks:*", 0).Iterator()
-		for iter.Next(ctx) {
-			RDB.Del(ctx, iter.Val())
-		}
-
-		c.JSON(http.StatusOK, gin.H{
-			"status":  "success",
-			"message": "清理完成！数据表已重置（ID 将从 1 开始），并同步清空了相关 Redis 缓存",
-		})
-	})
-
-	r.Run(":8080")
+	// 阻塞主goroutine，直到接收到中断信号
+	// 这里可以添加信号监听逻辑，例如 os.Interrupt 或 syscall.SIGTERM
+	// 为了演示优雅关闭，我们暂时直接调用 cancelGlobal 和 WG.Wait
+	// 在实际生产环境中，这里应该是一个信号监听器
+	cancelGlobal()
+	WG.Wait()
+	fmt.Println("所有后台任务已优雅关闭，程序退出。")
 }

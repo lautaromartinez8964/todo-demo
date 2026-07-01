@@ -1,0 +1,19 @@
+services:
+  # 1.部署MySQL8.0容器
+  mysql-service:
+    image: mysql:8.0
+    container_name: todo-mysql-dev
+    environment:
+      MYSQL_ROOT_PASSWORD: "123456" # 数据库密码
+      MYSQL_DATABASE: "todo_db" # 启动时自动建立的数据库
+    ports:
+      - "3306:3306" # 映射MySQL端口
+    restart: always
+
+  # 2.部署 Redis7.0容器
+  redis-service:
+    image: redis:7.0
+    container_name: todo-redis-dev
+    ports:
+      - "6379:6379"  # 映射Redis端口
+    restart: always
