@@ -21,7 +21,7 @@ func deferNoName() int {
 	return result // 第一步：隐式返回值变量 = result (即 1); 第二步：执行 defer (局部变量 result 变为 2); 第三步：返回隐式返回值变量 (仍为 1)
 }
 
-func main() {
+func mai() {
 	fmt.Println("有名返回值执行结果:", deferTiming()) // 应该是多少？
 	fmt.Println("无名返回值执行结果:", deferNoName()) // 应该是多少？
 }
