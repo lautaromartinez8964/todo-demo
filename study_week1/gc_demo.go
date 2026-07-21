@@ -10,7 +10,7 @@ func allocateTiles() {
 	_ = make([]byte, 10*1024*1024) // 每次生成10mb的临时内存
 }
 
-func main() {
+func main1() {
 	for i := 0; i < 5; i++ {
 		allocateTiles()
 		runtime.GC() // 手动强制触发一次大扫除
